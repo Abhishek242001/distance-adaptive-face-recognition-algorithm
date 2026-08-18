@@ -1,0 +1,12 @@
+﻿# NOTE on GPU: DirectML works with any DirectX12-capable GPU on Windows
+# (NVIDIA/AMD/Intel) with no separate CUDA toolkit install needed.
+# Only one onnxruntime variant should be installed at a time:
+#     pip uninstall onnxruntime onnxruntime-gpu -y
+#     pip install onnxruntime-directml
+insightface
+onnxruntime-directml
+opencv-python
+numpy
+scipy
+matplotlib
+flask
