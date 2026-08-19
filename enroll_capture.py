@@ -178,8 +178,19 @@ PAGE_TEMPLATE = """
 async function refreshStatus() {{
   const r = await fetch('/status');
   const j = await r.json();
-  document.getElementById('personInput').value = j.person;
-  document.getElementById('depthInput').value = j.depth;
+  // Only overwrite these inputs if the user is NOT currently typing in
+  // them -- otherwise the 2-second poll below stomps on whatever they're
+  // mid-typing (e.g. deleting "1" to type "5") before they get a chance
+  // to tap "Set". document.activeElement is the element currently
+  // focused/being typed into.
+  const personEl = document.getElementById('personInput');
+  const depthEl = document.getElementById('depthInput');
+  if (document.activeElement !== personEl) {{
+    personEl.value = j.person;
+  }}
+  if (document.activeElement !== depthEl) {{
+    depthEl.value = j.depth;
+  }}
   if (j.done) {{
     document.getElementById('status').innerText =
       "All 4 views captured for " + j.person + " at " + j.depth + "m! Change person and/or distance above and keep going, no restart needed.";

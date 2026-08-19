@@ -1,4 +1,4 @@
-﻿"""
+"""
 api_server.py
 --------------
 V3 -- ArcFace + SNR pipeline, served as a production HTTP API, PLUS a
@@ -68,6 +68,8 @@ STREAM_STATE = {
     "latest_jpeg": None,
     "lock": threading.Lock(),
     "camera_index": 0,
+    "source": None,  # None = use camera_index (local webcam); otherwise an
+                      # RTSP/HTTP URL string, e.g. "rtsp://user:pass@192.168.1.50:554/stream1"
     "detect_every_n": 5,
     "last_error": None,
 }
@@ -220,7 +222,8 @@ STREAM_PAGE_HTML = """<!DOCTYPE html>
 <body>
 <div class="nav"><a href="/test">Photo test</a> &nbsp;|&nbsp; <a href="/stream_page">Live stream</a> &nbsp;|&nbsp; <a href="/report">Report</a></div>
 <h2>ADAR v3 - Live Stream</h2>
-<p style="font-size:13px;color:#999;">Streams the LAPTOP's webcam with live detection boxes drawn on it. Green box = ACCEPT, red = REJECT.</p>
+<p style="font-size:13px;color:#999;">Streams a camera with live detection boxes drawn on it. Green box = ACCEPT, red = REJECT.</p>
+<input type="text" id="sourceInput" placeholder="Leave blank for laptop webcam, or paste rtsp://user:pass@ip:port/path" style="width:100%; box-sizing:border-box; padding:10px; font-size:13px; margin:6px 0; border-radius:6px; border:1px solid #444; background:#1e1e1e; color:#eee;">
 <button id="startBtn">Start</button>
 <button id="stopBtn">Stop</button>
 <div id="status"></div>
@@ -232,7 +235,12 @@ const statusEl = document.getElementById('status');
 
 document.getElementById('startBtn').addEventListener('click', async () => {
   statusEl.textContent = 'Starting camera...';
-  const resp = await fetch('/stream/start', { method: 'POST' });
+  const source = document.getElementById('sourceInput').value.trim();
+  const resp = await fetch('/stream/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(source ? { source } : {})
+  });
   const data = await resp.json();
   statusEl.textContent = data.message || '';
   feed.src = '/stream?' + Date.now();
@@ -452,7 +460,16 @@ def error_response(message: str, status_code: int = 400):
 # ---------------------------------------------------------------------
 
 def camera_worker():
-    cap = cv2.VideoCapture(STREAM_STATE["camera_index"], cv2.CAP_DSHOW)
+    source = STREAM_STATE.get("source") or STREAM_STATE["camera_index"]
+    # RTSP/HTTP URLs must NOT use CAP_DSHOW -- that backend is Windows
+    # local-webcam-only and will fail to open a network stream. Only pass
+    # CAP_DSHOW when the source is a local integer camera index.
+    if isinstance(source, str) and source.strip().lower().startswith(("rtsp://", "http://", "https://")):
+        cap = cv2.VideoCapture(source)
+        print(f"[stream] Opening network source: {source}")
+    else:
+        cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+        print(f"[stream] Opening local camera index: {source}")
     if not cap.isOpened():
         STREAM_STATE["last_error"] = f"Could not open camera index {STREAM_STATE['camera_index']}"
         STREAM_STATE["running"] = False
@@ -515,6 +532,13 @@ def mjpeg_generator():
 def stream_start():
     if STREAM_STATE["running"]:
         return jsonify({"success": True, "message": "Stream already running."}), 200
+
+    # Optional JSON body: {"source": "rtsp://user:pass@192.168.1.50:554/stream1"}
+    # If omitted or empty, falls back to the local webcam (camera_index).
+    body = request.get_json(silent=True) or {}
+    requested_source = body.get("source")
+    STREAM_STATE["source"] = requested_source.strip() if requested_source else None
+
     STREAM_STATE["running"] = True
     STREAM_STATE["last_error"] = None
     t = threading.Thread(target=camera_worker, daemon=True)
