@@ -10,3 +10,6 @@ numpy
 scipy
 matplotlib
 flask
+# Needed by enroll_capture.py's WebSocket-based remote capture page
+# (replaces the old 2s HTTP polling loop).
+flask-socketio
