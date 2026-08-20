@@ -23,13 +23,28 @@ this works, with worked numeric examples at every step.
 ```
 api_server.py         Flask HTTP API — the production entry point
 calibrate.py           Fits the decay curve (k, gamma, sigma0) from captured photos
-enroll_capture.py       Phone-based remote-shutter capture tool for enrollment
+enroll_capture.py       Phone-based remote-shutter capture tool for enrollment (WebSocket-based)
 utils.py                 Shared face detection / embedding / geometry helpers
+adar_admin.py              ONE-FILE all-in-one admin panel: enroll + calibrate + live
+                             inference from a single browser page (WebSocket-based)
 requirements.txt
 README.md                 (this file)
 ALGORITHM.md               Full mathematical walkthrough of the algorithm
 V3_README.md                 Detailed setup/usage notes and worked examples
 ```
+
+Two ways to use this project:
+
+- **4-script pipeline** (`enroll_capture.py` → `calibrate.py` → `api_server.py`) —
+  run each step separately, closer to the original research workflow.
+- **`adar_admin.py`** — the same underlying math and enrollment method in
+  one script with a single browser-based admin panel (enroll, calibrate,
+  and run live inference all from one page, no separate steps).
+
+Both the remote enrollment page (`enroll_capture.py`) and the admin
+panel (`adar_admin.py`) push live status over a **WebSocket**
+(Flask-SocketIO) instead of polling on a timer, so the Person/Distance
+fields never get overwritten while you're mid-typing on a phone.
 
 ## Served routes (`api_server.py`)
 
@@ -49,7 +64,11 @@ V3_README.md                 Detailed setup/usage notes and worked examples
 
 ```bash
 pip install -r requirements.txt
+```
 
+**Option A — 4-script pipeline:**
+
+```bash
 # 1. Enroll people (phone becomes the remote shutter)
 python enroll_capture.py
 
@@ -63,6 +82,21 @@ python api_server.py --calibration_dir calibration_output --port 8000
 Then open `http://<your-laptop-ip>:8000/test` on your phone (same WiFi)
 to try a live detection, or `/stream_page` to view the laptop's webcam
 with live detection boxes.
+
+**Option B — single-file admin panel:**
+
+```bash
+python adar_admin.py
+```
+
+Then open `http://<your-laptop-ip>:8000` (or the port you pass with
+`--port`) on your phone or laptop. You'll land on a choice screen —
+**Enroll a face** or **Start live inference** — and everything (enroll,
+calibrate, live view, report) happens from that one page.
+
+`requirements.txt` includes `flask-socketio`, needed by both
+`enroll_capture.py` and `adar_admin.py` for their WebSocket-based
+status updates.
 
 ## GPU acceleration
 
