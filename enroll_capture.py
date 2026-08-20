@@ -1,70 +1,48 @@
 """
 enroll_capture.py
 --------------------
-Remote-shutter version of enroll_capture.py, for when you're the only person
-around and can't both stand at a distance AND press a key on the laptop.
+Two-phase remote enrollment flow, driven entirely from your phone.
+
+WHY TWO PHASES:
+Typing a name and a handful of distances while a live camera preview
+is streaming in the background is exactly the situation that caused
+the old input-field-gets-clobbered bug. The fix here isn't just a
+smarter client-side guard -- it's removing the camera from the
+picture entirely while you're typing. The camera process/thread is
+not even started until you've finished entering everything and tap
+"Start capture".
 
 HOW IT WORKS:
-This starts a tiny local web server on your laptop. Your phone (on the
-SAME WiFi network as the laptop) opens a webpage served by that
-server, which shows a live preview from the laptop's webcam and one
-big CAPTURE button. Both the PERSON name and the DISTANCE are set
-right there on the phone page -- you never touch the terminal again
-after the one command that starts the server.
+  PHASE 1 -- SETUP (no camera):
+    On your phone: type the person's name, choose how many distances
+    you're capturing at (a stepper, 1-8), then a text box appears for
+    each distance (in meters). Nothing here touches the webcam.
 
-WEBSOCKET NOTE (why this version doesn't fight you while typing):
-The old version polled GET /status every 2 seconds over plain HTTP and
-overwrote the Person/Distance boxes with whatever the server had, which
-kept clobbering half-typed values even with a "don't overwrite while
-focused" guard (timing between the poll tick and a fast phone tap/typing
-race is exactly what caused the visible refresh-while-typing).
+  PHASE 2 -- GUIDED CAPTURE (camera opens once, stays open):
+    Tapping "Start capture" opens the laptop's webcam and walks you
+    through your distances in ascending order. At each distance you
+    manually tap CAPTURE four times (front / left / right / top) --
+    capture is never automatic, since you have to physically walk to
+    each mark and frame yourself. After the 4th view the app advances
+    to the next distance on its own. When every distance is done you
+    land on a completion screen with a button to enroll another
+    person, which returns you to Phase 1 (and closes the camera again).
 
-This version uses a WebSocket (Flask-SocketIO) instead. There is NO
-periodic timer at all -- the server only ever *pushes* a status update
-when something actually changes: a capture happens, or you tap
-"Set person" / "Set distance". Nothing runs in the background to
-interrupt you while you're mid-typing, so the field only updates
-when you yourself trigger it.
+Saved files land in the same folder convention every other script in
+this toolkit expects:
+    dataset/<person>/depth_XXXm/{front,left,right,top}.jpg
 
 SETUP:
-1. Make sure your phone and laptop are on the same WiFi network.
-2. Find your laptop's local IP address:
-     Windows:      ipconfig            -> look for "IPv4 Address"
-     Mac/Linux:    ifconfig | grep inet
-   It will look something like 192.168.1.23
-3. Install the one extra dependency this version needs (WebSocket
-   support), then run the script once:
-     pip install flask-socketio
-     python enroll_capture.py
-4. On your phone's browser, go to:
-     http://<that-ip-address>:5000
-5. You'll see a PERSON box, a DISTANCE box, a live preview, and a
-   CAPTURE button.
-     - Type the person name (e.g. person_01) and tap "Set person".
-     - Type the distance in meters (e.g. 0.5) and tap "Set distance".
-   Frame yourself for the "front" prompt and tap CAPTURE. The page
-   auto-advances through all 4 views (front -> left -> right -> top).
-6. For a NEW distance, same person: just walk to the new mark, type
-   the new number in the distance box, tap "Set distance" again, and
-   keep capturing. This resets the 4-view progress and starts saving
-   into that distance's own folder.
-7. For a NEW person: type the new name in the person box, tap
-   "Set person", then set the distance and continue. All from the
-   phone -- the terminal is never touched again.
-8. A small indicator in the corner shows "Connected" / "Reconnecting..."
-   for the WebSocket link, so you always know if the page has silently
-   dropped its connection to the laptop.
+1. Same WiFi network for phone + laptop.
+2. Find your laptop's local IP (ipconfig / ifconfig).
+3. pip install flask-socketio
+4. python enroll_capture.py
+5. On your phone: http://<that-ip>:5000
 
-Usage (run ONCE, covers your entire session -- every person, every distance):
+Usage (run ONCE, covers every person you enroll this session):
     python enroll_capture.py
 
-Optional starting values, purely for convenience (both are fully
-editable from the phone afterwards, so these are just what the page
-shows when it first loads):
-    python enroll_capture.py --person person_01 --depth 0.5
-
-Press Ctrl+C in the terminal only when you're completely done with
-EVERYONE.
+Press Ctrl+C in the terminal only when fully done with everyone.
 """
 
 import argparse
@@ -87,100 +65,100 @@ VIEW_PROMPTS = {
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "adar-enroll-capture"
-# threading async_mode needs no extra dependency beyond flask-socketio
-# itself (no eventlet/gevent required) and plays nicely with the
-# existing background camera_loop thread below.
 socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 
-# Shared state between the camera-reading thread and the Flask routes.
+# ---------------------------------------------------------------------
+# Shared state
+# ---------------------------------------------------------------------
 state = {
-    "frame": None,          # latest raw frame (BGR numpy array)
-    "view_index": 0,        # which of VIEWS we're currently capturing
-    "done": False,          # all 4 views captured for this person+depth
-    "last_saved": None,     # path of the most recently saved file, for on-page confirmation
-    "person": None,         # current person folder name -- changeable from the UI
-    "depth": None,          # current distance in meters -- changeable from the UI
+    "phase": "setup",       # "setup" | "capture" | "done"
+    "person": None,
+    "distances": [],        # sorted list of floats, set once at "Start capture"
+    "dist_index": 0,        # which distance we're currently capturing
+    "view_index": 0,        # which of VIEWS within the current distance
+    "last_saved": None,
+    "frame": None,           # latest raw camera frame (BGR numpy array)
     "lock": threading.Lock(),
 }
 
-
-def _refresh_out_dir():
-    """Recompute the save folder from the current person+depth and reset
-    view progress. Called whenever either person or depth changes."""
-    out_dir = Path(app.config["DATASET_ROOT"]) / state["person"] / depth_folder_name(state["depth"])
-    state["view_index"] = 0
-    state["done"] = False
-    state["last_saved"] = None
-    app.config["OUT_DIR"] = str(out_dir)
-
-
-def _status_payload():
-    """Build the same status dict the old /status endpoint returned --
-    now pushed over the socket instead of polled."""
-    with state["lock"]:
-        idx = state["view_index"]
-        done = state["done"]
-        depth = state["depth"]
-        person = state["person"]
-        last_saved = state["last_saved"]
-    prompt = VIEW_PROMPTS[VIEWS[idx]] if idx < len(VIEWS) else ""
-    return {
-        "view_index": idx,
-        "prompt": prompt,
-        "done": done,
-        "depth": depth,
-        "person": person,
-        "last_saved": last_saved,
-    }
+# Camera is only ever running during the "capture" phase -- started when
+# Phase 1 is submitted, stopped when a session finishes or is reset.
+camera = {
+    "cap": None,
+    "thread": None,
+    "running": False,
+    "index": 0,
+}
 
 
-def _push_status():
-    """Broadcast the current status to every connected client (in
-    practice just your phone). Only called right after a real change,
-    never on a timer."""
-    socketio.emit("status", _status_payload())
-
-
-def set_depth(new_depth):
-    """Switch the active capture distance without restarting the server."""
-    with state["lock"]:
-        state["depth"] = new_depth
-        _refresh_out_dir()
-
-
-def set_person(new_person):
-    """Switch the active person without restarting the server."""
-    with state["lock"]:
-        state["person"] = new_person
-        _refresh_out_dir()
-
-
-def camera_loop(camera_index):
-    """Continuously reads frames from the webcam in the background so the
-    preview stream and capture button always see a fresh frame, not a
-    stale buffered one."""
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open webcam. Try a different --camera_index (0, 1, 2...).")
-    while True:
+def _camera_loop():
+    cap = camera["cap"]
+    while camera["running"]:
         ret, frame = cap.read()
         if ret:
             with state["lock"]:
                 state["frame"] = frame
-        time.sleep(0.03)  # ~30fps read loop
+        time.sleep(0.03)  # ~30fps
+
+
+def start_camera(camera_index):
+    if camera["running"]:
+        return
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open webcam. Try a different --camera_index (0, 1, 2...).")
+    camera["cap"] = cap
+    camera["running"] = True
+    t = threading.Thread(target=_camera_loop, daemon=True)
+    camera["thread"] = t
+    t.start()
+
+
+def stop_camera():
+    camera["running"] = False
+    if camera["cap"] is not None:
+        camera["cap"].release()
+        camera["cap"] = None
+    with state["lock"]:
+        state["frame"] = None
+
+
+def _current_out_dir():
+    person = state["person"]
+    depth = state["distances"][state["dist_index"]]
+    return Path(app.config["DATASET_ROOT"]) / person / depth_folder_name(depth)
+
+
+def _status_payload():
+    with state["lock"]:
+        payload = {
+            "phase": state["phase"],
+            "person": state["person"],
+            "distances": state["distances"],
+            "dist_index": state["dist_index"],
+            "view_index": state["view_index"],
+            "last_saved": state["last_saved"],
+        }
+    if payload["phase"] == "capture" and payload["dist_index"] < len(payload["distances"]):
+        payload["current_distance"] = payload["distances"][payload["dist_index"]]
+        payload["prompt"] = VIEW_PROMPTS[VIEWS[payload["view_index"]]]
+    else:
+        payload["current_distance"] = None
+        payload["prompt"] = ""
+    return payload
+
+
+def _push_status():
+    socketio.emit("status", _status_payload())
 
 
 def mjpeg_generator():
-    """Unchanged from before -- the live preview stays a plain MJPEG HTTP
-    stream (an <img> tag re-requesting frames), which is a completely
-    separate mechanism from the status WebSocket and was never the
-    source of the typing-interrupt problem."""
     while True:
         with state["lock"]:
             frame = None if state["frame"] is None else state["frame"].copy()
         if frame is not None:
-            view = VIEWS[state["view_index"]] if state["view_index"] < len(VIEWS) else None
-            if view:
+            if state["phase"] == "capture" and state["dist_index"] < len(state["distances"]):
+                view = VIEWS[state["view_index"]]
                 cv2.putText(frame, VIEW_PROMPTS[view], (20, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             ok, buf = cv2.imencode(".jpg", frame)
@@ -194,21 +172,67 @@ PAGE_TEMPLATE = """
 <html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ADAR Remote Capture</title>
+  <title>ADAR Enrollment</title>
   <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
   <style>
-    body {{ font-family: sans-serif; text-align: center; background: #111; color: #eee; margin: 0; padding: 10px; }}
-    img {{ width: 100%; max-width: 480px; border-radius: 8px; }}
-    #status {{ font-size: 20px; margin: 12px 0; }}
-    button {{ font-size: 24px; padding: 20px 50px; border-radius: 12px; border: none;
-              background: #2ecc71; color: white; margin-top: 10px; }}
-    button:disabled {{ background: #555; }}
-    #confirm {{ color: #2ecc71; min-height: 24px; margin-top: 10px; }}
-    .field {{ margin: 10px 0; }}
-    .field label {{ font-size: 16px; }}
-    .field input {{ font-size: 22px; width: 140px; text-align: center; padding: 6px;
-                     border-radius: 8px; border: none; margin-top: 6px; }}
-    .field button {{ font-size: 16px; padding: 10px 20px; background: #3498db; margin-left: 8px; }}
+    :root {{
+      --bg: #0c0d10; --panel: #16181d; --panel-2: #1e2127; --line: #2a2e37;
+      --text: #e9ebf0; --dim: #8b909c; --accent: #4fd1a5; --accent-dim: #2a5f4d;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; background: var(--bg); color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            display: flex; justify-content: center; padding: 20px 14px 60px; }}
+    .phone {{ width: 100%; max-width: 420px; }}
+    .eyebrow {{ font-family: monospace; font-size: 11px; letter-spacing: .12em;
+                color: var(--accent); text-transform: uppercase; margin-bottom: 4px; }}
+    h1 {{ font-size: 20px; margin: 0 0 18px; font-weight: 600; }}
+    .card {{ background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+             padding: 18px; margin-bottom: 14px; }}
+    label {{ display: block; font-size: 12px; color: var(--dim); margin-bottom: 6px; font-family: monospace; }}
+    input[type=text], input[type=number] {{
+      width: 100%; background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+      font-size: 16px; padding: 12px 14px; border-radius: 9px; outline: none; }}
+    input:focus {{ border-color: var(--accent); }}
+    .field {{ margin-bottom: 16px; }}
+    .field:last-child {{ margin-bottom: 0; }}
+    .distance-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 4px; }}
+    .distance-grid .field {{ margin-bottom: 0; }}
+    .distance-grid label {{ font-size: 11px; }}
+    button {{ font: inherit; border: none; border-radius: 10px; cursor: pointer; }}
+    .btn-primary {{ width: 100%; background: var(--accent); color: #06231a; font-weight: 700;
+                    font-size: 16px; padding: 15px; margin-top: 18px; }}
+    .btn-primary:disabled {{ background: #34383f; color: #6b6f78; cursor: not-allowed; }}
+    .btn-secondary {{ background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+                      font-size: 14px; padding: 9px 14px; width: 100%; margin-top: 8px; }}
+    .stepper {{ display: flex; align-items: center; justify-content: space-between;
+                background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; padding: 4px; }}
+    .stepper button {{ background: transparent; color: var(--accent); font-size: 20px; width: 40px; height: 40px; }}
+    .stepper .count {{ font-family: monospace; font-size: 20px; font-weight: 700; }}
+    .hidden {{ display: none; }}
+    .progress-row {{ display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }}
+    .dist-pill {{ flex: 1; min-width: 54px; text-align: center; font-family: monospace; font-size: 12px;
+                  padding: 8px 4px; border-radius: 8px; background: var(--panel-2); color: var(--dim);
+                  border: 1px solid var(--line); }}
+    .dist-pill.active {{ background: var(--accent-dim); color: var(--accent); border-color: var(--accent); }}
+    .dist-pill.done {{ color: var(--dim); text-decoration: line-through; }}
+    img.preview {{ width: 100%; border-radius: 12px; border: 1px solid var(--line); display: block; }}
+    .views-row {{ display: flex; gap: 8px; margin: 14px 0; }}
+    .view-chip {{ flex: 1; text-align: center; padding: 10px 4px; border-radius: 8px;
+                  background: var(--panel-2); border: 1px solid var(--line); font-size: 12px; color: var(--dim); }}
+    .view-chip.current {{ border-color: var(--accent); color: var(--accent); }}
+    .view-chip.done {{ background: var(--accent-dim); color: var(--accent); }}
+    .status-line {{ text-align: center; font-size: 14px; color: var(--dim); margin: 10px 0 4px; }}
+    .status-line b {{ color: var(--text); }}
+    .btn-capture {{ width: 100%; background: var(--accent); color: #06231a; font-weight: 700;
+                    font-size: 17px; padding: 18px; margin-top: 14px; }}
+    .btn-capture:disabled {{ background: #34383f; color: #6b6f78; }}
+    .note {{ font-size: 12px; color: var(--dim); text-align: center; margin-top: 10px; line-height: 1.5; }}
+    #confirm {{ color: var(--accent); font-size: 12px; text-align: center; min-height: 16px; margin-top: 6px; }}
+    .done-screen {{ text-align: center; padding: 30px 10px; }}
+    .done-screen .check {{ width: 56px; height: 56px; border-radius: 50%; background: var(--accent-dim);
+                           color: var(--accent); font-size: 28px; display: flex; align-items: center;
+                           justify-content: center; margin: 0 auto 16px; }}
     #connIndicator {{ position: fixed; top: 8px; right: 10px; font-size: 12px; padding: 4px 10px;
                        border-radius: 10px; background: #333; }}
     #connIndicator.connected {{ background: #1e5c33; color: #6fe38f; }}
@@ -216,105 +240,167 @@ PAGE_TEMPLATE = """
   </style>
 </head>
 <body>
-  <div id="connIndicator">Connecting...</div>
-  <h2>ADAR Remote Capture</h2>
+<div id="connIndicator">Connecting...</div>
+<div class="phone">
 
-  <div class="field">
-    <label for="personInput">Person:</label><br>
-    <input id="personInput" type="text" value="{person}">
-    <button onclick="applyPerson()">Set person</button>
+  <div id="phase-setup">
+    <div class="eyebrow">Step 1 of 2 -- no camera</div>
+    <h1>Enrollment setup</h1>
+    <div class="card">
+      <div class="field">
+        <label for="nameInput">Person name</label>
+        <input type="text" id="nameInput" placeholder="e.g. person_01">
+      </div>
+      <div class="field">
+        <label>Number of distances to capture</label>
+        <div class="stepper">
+          <button type="button" onclick="changeCount(-1)">-</button>
+          <span class="count" id="countDisplay">3</span>
+          <button type="button" onclick="changeCount(1)">+</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>Distance values (meters)</label>
+        <div class="distance-grid" id="distanceGrid"></div>
+      </div>
+    </div>
+    <button class="btn-primary" id="startBtn" onclick="startCapture()">Start capture &rarr;</button>
+    <div class="note">The camera stays off until every field here is filled in and submitted.</div>
+    <div id="setupError" class="note" style="color:#ff8a6b;"></div>
   </div>
 
-  <div class="field">
-    <label for="depthInput">Distance (m):</label><br>
-    <input id="depthInput" type="number" step="0.1" min="0" value="{depth}">
-    <button onclick="applyDepth()">Set distance</button>
+  <div id="phase-capture" class="hidden">
+    <div class="eyebrow" id="personLabel"></div>
+    <h1>Guided capture</h1>
+    <div class="progress-row" id="progressRow"></div>
+    <div class="card">
+      <img class="preview" src="/video_feed">
+      <div class="views-row" id="viewsRow">
+        <div class="view-chip" data-view="front">FRONT</div>
+        <div class="view-chip" data-view="left">LEFT</div>
+        <div class="view-chip" data-view="right">RIGHT</div>
+        <div class="view-chip" data-view="top">TOP</div>
+      </div>
+      <div class="status-line" id="statusLine">Loading...</div>
+      <button class="btn-capture" id="captureBtn" onclick="doCapture()">CAPTURE</button>
+      <div id="confirm"></div>
+    </div>
   </div>
 
-  <div id="status">Loading...</div>
-  <img src="/video_feed">
-  <br>
-  <button id="capBtn" onclick="doCapture()">CAPTURE</button>
-  <div id="confirm"></div>
+  <div id="phase-done" class="hidden">
+    <div class="done-screen">
+      <div class="check">&#10003;</div>
+      <h1>All distances captured</h1>
+      <p class="note" id="doneSummary"></p>
+      <button class="btn-secondary" onclick="startOver()">Enroll another person</button>
+    </div>
+  </div>
+
+</div>
 
 <script>
 const socket = io();
-const personEl = document.getElementById('personInput');
-const depthEl = document.getElementById('depthInput');
-const statusEl = document.getElementById('status');
-const confirmEl = document.getElementById('confirm');
-const capBtn = document.getElementById('capBtn');
 const connIndicator = document.getElementById('connIndicator');
+const setupDiv = document.getElementById('phase-setup');
+const captureDiv = document.getElementById('phase-capture');
+const doneDiv = document.getElementById('phase-done');
 
-// "Dirty" flags instead of a focus check. document.activeElement is not
-// reliable on phones: numeric keypads, autocomplete/suggestion bars, and
-// autocorrect all cause brief blur/refocus events *between keystrokes*,
-// so a status push landing in that split-second gap still overwrote the
-// field mid-type -- which is exactly the "updates very fast while I'm
-// typing" symptom. Instead, a field is "dirty" the moment you start
-// editing it, and stays dirty (immune to incoming pushes) until you
-// explicitly commit it with the Set button. Focus/blur no longer matter.
-let personDirty = false;
-let depthDirty = false;
-personEl.addEventListener('input', () => {{ personDirty = true; }});
-depthEl.addEventListener('input', () => {{ depthDirty = true; }});
+socket.on('connect', () => {{ connIndicator.innerText = 'Connected'; connIndicator.className = 'connected'; }});
+socket.on('disconnect', () => {{ connIndicator.innerText = 'Reconnecting...'; connIndicator.className = 'disconnected'; }});
 
-socket.on('connect', () => {{
-  connIndicator.innerText = 'Connected';
-  connIndicator.className = 'connected';
-}});
-
-socket.on('disconnect', () => {{
-  connIndicator.innerText = 'Reconnecting...';
-  connIndicator.className = 'disconnected';
-}});
-
-// This is the ONLY place the UI updates from -- pushed by the server
-// right after a real change (capture / set_person / set_depth), never
-// on a timer. That's what stops it from clobbering the boxes while
-// you're typing: there is nothing to race against.
-socket.on('status', (j) => {{
-  // Only sync a field from the server if you haven't started editing it
-  // yourself since the last commit. This replaces the old focus check,
-  // which could still get raced by mobile keyboard blur/refocus quirks.
-  if (!personDirty) personEl.value = j.person;
-  if (!depthDirty) depthEl.value = j.depth;
-
-  if (j.done) {{
-    statusEl.innerText =
-      "All 4 views captured for " + j.person + " at " + j.depth + "m! Change person and/or distance above and keep going, no restart needed.";
-    capBtn.disabled = true;
-  }} else {{
-    statusEl.innerText =
-      j.person + " @ " + j.depth + "m -- View " + (j.view_index + 1) + " of 4: " + j.prompt;
-    capBtn.disabled = false;
+let distCount = 3;
+function renderDistanceGrid() {{
+  const grid = document.getElementById('distanceGrid');
+  grid.innerHTML = '';
+  for (let i = 0; i < distCount; i++) {{
+    const field = document.createElement('div');
+    field.className = 'field';
+    field.innerHTML = `<label>Distance ${{i + 1}}</label><input type="number" step="0.1" min="0" class="distInput">`;
+    grid.appendChild(field);
   }}
-
-  if (j.last_saved) {{
-    confirmEl.innerText = "Saved: " + j.last_saved;
-  }}
-}});
-
-function applyPerson() {{
-  const newPerson = personEl.value.trim();
-  if (!newPerson) return;
-  confirmEl.innerText = "";
-  personDirty = false;  // committed -- safe to accept server syncs again
-  socket.emit('set_person', {{person: newPerson}});
 }}
+function changeCount(delta) {{
+  distCount = Math.max(1, Math.min(8, distCount + delta));
+  document.getElementById('countDisplay').innerText = distCount;
+  renderDistanceGrid();
+}}
+renderDistanceGrid();
 
-function applyDepth() {{
-  const newDepth = parseFloat(depthEl.value);
-  if (isNaN(newDepth)) return;
-  confirmEl.innerText = "";
-  depthDirty = false;  // committed -- safe to accept server syncs again
-  socket.emit('set_depth', {{depth: newDepth}});
+function startCapture() {{
+  const errEl = document.getElementById('setupError');
+  const name = document.getElementById('nameInput').value.trim();
+  const inputs = Array.from(document.querySelectorAll('.distInput'));
+  const vals = inputs.map(i => parseFloat(i.value));
+  errEl.innerText = '';
+  if (!name) {{ errEl.innerText = 'Enter a person name.'; return; }}
+  if (vals.some(v => isNaN(v) || v < 0)) {{ errEl.innerText = 'Fill in every distance box with a valid number.'; return; }}
+  document.getElementById('startBtn').disabled = true;
+  socket.emit('start_capture', {{person: name, distances: vals}});
 }}
 
 function doCapture() {{
-  capBtn.disabled = true;
+  document.getElementById('captureBtn').disabled = true;
   socket.emit('capture');
 }}
+
+function startOver() {{
+  socket.emit('reset');
+}}
+
+socket.on('setup_error', (j) => {{
+  document.getElementById('setupError').innerText = j.message;
+  document.getElementById('startBtn').disabled = false;
+}});
+
+socket.on('status', (j) => {{
+  document.getElementById('startBtn').disabled = false;
+
+  if (j.phase === 'setup') {{
+    setupDiv.classList.remove('hidden');
+    captureDiv.classList.add('hidden');
+    doneDiv.classList.add('hidden');
+    return;
+  }}
+
+  if (j.phase === 'capture') {{
+    setupDiv.classList.add('hidden');
+    captureDiv.classList.remove('hidden');
+    doneDiv.classList.add('hidden');
+
+    document.getElementById('personLabel').innerText = (j.person || '').toUpperCase();
+
+    const row = document.getElementById('progressRow');
+    row.innerHTML = '';
+    j.distances.forEach((d, i) => {{
+      const pill = document.createElement('div');
+      pill.className = 'dist-pill' + (i === j.dist_index ? ' active' : '') + (i < j.dist_index ? ' done' : '');
+      pill.innerText = d + 'm';
+      row.appendChild(pill);
+    }});
+
+    document.querySelectorAll('.view-chip').forEach((chip, i) => {{
+      chip.classList.toggle('current', i === j.view_index);
+      chip.classList.toggle('done', i < j.view_index);
+    }});
+
+    document.getElementById('statusLine').innerHTML =
+      j.person + ' @ <b>' + j.current_distance + 'm</b> -- view ' + (j.view_index + 1) + ' of 4: ' + j.prompt;
+    document.getElementById('captureBtn').disabled = false;
+
+    if (j.last_saved) {{
+      document.getElementById('confirm').innerText = 'Saved: ' + j.last_saved;
+    }}
+    return;
+  }}
+
+  if (j.phase === 'done') {{
+    setupDiv.classList.add('hidden');
+    captureDiv.classList.add('hidden');
+    doneDiv.classList.remove('hidden');
+    document.getElementById('doneSummary').innerText =
+      'Captured 4 views at each of ' + j.distances.length + ' distances (' + j.distances.join('m, ') + 'm) for ' + j.person + '.';
+  }}
+}});
 </script>
 </body>
 </html>
@@ -323,10 +409,11 @@ function doCapture() {{
 
 @app.route("/")
 def index():
-    with state["lock"]:
-        person = state["person"]
-        depth = state["depth"]
-    return PAGE_TEMPLATE.format(person=person, depth=depth)
+    # .format() with no args collapses the {{ }} escaping used throughout
+    # the embedded CSS/JS back down to literal { } -- there are no actual
+    # server-side placeholders left to fill in (person/depth are no longer
+    # pre-rendered into the page; Phase 1 collects them entirely client-side).
+    return PAGE_TEMPLATE.format()
 
 
 @app.route("/video_feed")
@@ -336,58 +423,85 @@ def video_feed():
 
 @socketio.on("connect")
 def on_connect():
-    """Send the current status immediately to a newly-connected/
-    reconnected client, so the page is never stuck on 'Loading...'."""
     socketio.emit("status", _status_payload(), to=request.sid)
 
 
-@socketio.on("set_person")
-def on_set_person(payload):
-    new_person = str(payload["person"]).strip()
-    if not new_person:
-        return
-    set_person(new_person)
-    _push_status()
-
-
-@socketio.on("set_depth")
-def on_set_depth(payload):
+@socketio.on("start_capture")
+def on_start_capture(payload):
+    person = str(payload.get("person", "")).strip()
+    raw_distances = payload.get("distances", [])
     try:
-        new_depth = float(payload["depth"])
+        distances = sorted(float(d) for d in raw_distances)
     except (TypeError, ValueError):
+        socketio.emit("setup_error", {"message": "Invalid distance value."}, to=request.sid)
         return
-    set_depth(new_depth)
+
+    if not person or not distances:
+        socketio.emit("setup_error", {"message": "Person name and at least one distance are required."}, to=request.sid)
+        return
+
+    with state["lock"]:
+        state["phase"] = "capture"
+        state["person"] = person
+        state["distances"] = distances
+        state["dist_index"] = 0
+        state["view_index"] = 0
+        state["last_saved"] = None
+
+    try:
+        start_camera(camera["index"])
+    except RuntimeError as e:
+        with state["lock"]:
+            state["phase"] = "setup"
+        socketio.emit("setup_error", {"message": str(e)}, to=request.sid)
+        return
+
     _push_status()
 
 
 @socketio.on("capture")
 def on_capture():
     with state["lock"]:
-        if state["done"] or state["frame"] is None:
+        if state["phase"] != "capture" or state["frame"] is None:
             saved = None
         else:
             view = VIEWS[state["view_index"]]
-            out_dir = Path(app.config["OUT_DIR"])
+            out_dir = _current_out_dir()
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / f"{view}.jpg"
             cv2.imwrite(str(out_path), state["frame"])
             state["last_saved"] = str(out_path)
+            saved = str(out_path)
+
             state["view_index"] += 1
             if state["view_index"] >= len(VIEWS):
-                state["done"] = True
-            saved = str(out_path)
+                state["view_index"] = 0
+                state["dist_index"] += 1
+                if state["dist_index"] >= len(state["distances"]):
+                    state["phase"] = "done"
+
+    if state["phase"] == "done":
+        stop_camera()
+
     _push_status()
     return {"saved": saved}
 
 
+@socketio.on("reset")
+def on_reset():
+    stop_camera()
+    with state["lock"]:
+        state["phase"] = "setup"
+        state["person"] = None
+        state["distances"] = []
+        state["dist_index"] = 0
+        state["view_index"] = 0
+        state["last_saved"] = None
+    _push_status()
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--person", default="person_01",
-                         help="STARTING person name (e.g. person_01). You can change this later "
-                              "from the phone UI without restarting the script.")
-    parser.add_argument("--depth", type=float, default=1.0,
-                         help="STARTING distance in meters (e.g. 0.5). You can change this later "
-                              "from the phone UI without restarting the script.")
     parser.add_argument("--dataset_root", default="dataset")
     parser.add_argument("--camera_index", type=int, default=0)
     parser.add_argument("--host", default="0.0.0.0", help="0.0.0.0 lets your phone reach this over WiFi")
@@ -395,23 +509,16 @@ def main():
     args = parser.parse_args()
 
     app.config["DATASET_ROOT"] = args.dataset_root
+    camera["index"] = args.camera_index
 
-    with state["lock"]:
-        state["person"] = args.person
-        state["depth"] = args.depth
-        _refresh_out_dir()
-
-    t = threading.Thread(target=camera_loop, args=(args.camera_index,), daemon=True)
-    t.start()
-
-    print(f"\nStarting remote capture server (starting person='{args.person}', starting depth={args.depth}m)")
+    print(f"\nStarting two-phase enrollment server.")
     print("On your PHONE (same WiFi as this laptop), open:")
     print(f"   http://<this-laptop's-local-IP>:{args.port}")
     print("Find the local IP with 'ipconfig' (Windows) or 'ifconfig' (Mac/Linux) if you don't know it.")
-    print("Both PERSON and DISTANCE are editable right from the phone page from now on --")
-    print("you do NOT need to touch this terminal again until you're fully done. Press Ctrl+C then.\n")
-    print("(Status updates now travel over a WebSocket, pushed only on real changes --")
-    print("no more background polling clobbering the boxes while you type.)\n")
+    print("Phase 1 (name + distances) never touches the camera.")
+    print("Phase 2 opens the camera once 'Start capture' is tapped, and closes it again")
+    print("once all distances are done or you tap 'Enroll another person'.")
+    print("Press Ctrl+C when fully done with everyone.\n")
 
     socketio.run(app, host=args.host, port=args.port)
 
