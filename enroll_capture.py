@@ -246,6 +246,19 @@ const confirmEl = document.getElementById('confirm');
 const capBtn = document.getElementById('capBtn');
 const connIndicator = document.getElementById('connIndicator');
 
+// "Dirty" flags instead of a focus check. document.activeElement is not
+// reliable on phones: numeric keypads, autocomplete/suggestion bars, and
+// autocorrect all cause brief blur/refocus events *between keystrokes*,
+// so a status push landing in that split-second gap still overwrote the
+// field mid-type -- which is exactly the "updates very fast while I'm
+// typing" symptom. Instead, a field is "dirty" the moment you start
+// editing it, and stays dirty (immune to incoming pushes) until you
+// explicitly commit it with the Set button. Focus/blur no longer matter.
+let personDirty = false;
+let depthDirty = false;
+personEl.addEventListener('input', () => {{ personDirty = true; }});
+depthEl.addEventListener('input', () => {{ depthDirty = true; }});
+
 socket.on('connect', () => {{
   connIndicator.innerText = 'Connected';
   connIndicator.className = 'connected';
@@ -261,10 +274,11 @@ socket.on('disconnect', () => {{
 // on a timer. That's what stops it from clobbering the boxes while
 // you're typing: there is nothing to race against.
 socket.on('status', (j) => {{
-  // Still guard against overwriting a field you're actively typing in,
-  // in case a change arrives from elsewhere (e.g. a second phone/tab).
-  if (document.activeElement !== personEl) personEl.value = j.person;
-  if (document.activeElement !== depthEl) depthEl.value = j.depth;
+  // Only sync a field from the server if you haven't started editing it
+  // yourself since the last commit. This replaces the old focus check,
+  // which could still get raced by mobile keyboard blur/refocus quirks.
+  if (!personDirty) personEl.value = j.person;
+  if (!depthDirty) depthEl.value = j.depth;
 
   if (j.done) {{
     statusEl.innerText =
@@ -285,6 +299,7 @@ function applyPerson() {{
   const newPerson = personEl.value.trim();
   if (!newPerson) return;
   confirmEl.innerText = "";
+  personDirty = false;  // committed -- safe to accept server syncs again
   socket.emit('set_person', {{person: newPerson}});
 }}
 
@@ -292,6 +307,7 @@ function applyDepth() {{
   const newDepth = parseFloat(depthEl.value);
   if (isNaN(newDepth)) return;
   confirmEl.innerText = "";
+  depthDirty = false;  // committed -- safe to accept server syncs again
   socket.emit('set_depth', {{depth: newDepth}});
 }}
 
