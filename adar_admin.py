@@ -31,29 +31,41 @@ several people (2-5+) without editing any files by hand.
 
 Usage:
     python adar_admin.py
-    (asks you, right in the terminal, whether to use your webcam or
-    an RTSP URL -- or pass --source to skip the prompt)
+    (asks you, right in the terminal, for the RTSP URL -- or pass
+    --source to skip the prompt)
 
     python adar_admin.py --source "rtsp://user:pass@192.168.1.50:554/stream1"
-    python adar_admin.py --source 0
     python adar_admin.py --port 8000
+
+RTSP ONLY: this file no longer opens a local webcam index. It is meant
+to run against a real CCTV / IP camera stream, shared by enrollment
+preview and live inference alike. If you want to test against a
+laptop webcam instead, use the standalone enroll_capture.py /
+api_server.py pair, which still support a local camera index.
 
 Then open http://<this-machine's-ip>:8000 in a browser.
 
 WORKFLOW ON THE PAGE:
-    1. Enroll: set a person's name and a distance in meters, then tap
-       Capture 4 times (front/left/right/top -- the page tells you
-       which pose to make each time, same as enroll_capture.py).
-       Capture at MORE THAN ONE real distance per person if you can
-       (e.g. 0.5m and then 1.5m) -- one distance alone cannot fit a
-       meaningful gamma (noise-growth) curve; this is a documented,
-       inherent limitation of single-distance calibration, not a bug.
-    2. Repeat for every person.
+    1. Enroll (two-phase, same idea as enroll_capture.py):
+       Phase 1 -- setup, no camera: type the person's name, choose how
+       many distances you're capturing at, then fill in a box for each
+       distance (meters). Nothing here touches the RTSP stream.
+       Phase 2 -- guided capture: tap "Start capture" to reveal the
+       live preview and step through your distances in order, tapping
+       CAPTURE four times per distance (front/left/right/top -- the
+       page tells you which pose to make). Capture at MORE THAN ONE
+       real distance per person if you can (e.g. 0.5m and then 1.5m)
+       -- one distance alone cannot fit a meaningful gamma
+       (noise-growth) curve; this is a documented, inherent limitation
+       of single-distance calibration, not a bug.
+    2. Repeat for every person ("Enroll another person" returns you to
+       Phase 1).
     3. Tap "Calibrate" once everyone is enrolled (and again any time
        you add more people or more distances). This fits k/gamma/sigma0
        from everything captured so far.
     4. Start live inference -- now SNR-gated and distance-corrected,
-       exactly like api_server.py's /detect and live stream.
+       exactly like api_server.py's /detect and live stream. Uses the
+       same RTSP stream, already running in the background.
 """
 
 import argparse
@@ -530,28 +542,32 @@ CAMERA_STATE = {
     "latest_frame": None,
     "lock": threading.Lock(),
     "running": False,
+    "connecting": False,   # True while a reader thread is starting up / probing the URL
     "last_error": None,
+    "thread": None,
 }
 
 
 def open_capture(source):
-    if isinstance(source, str) and source.strip().lower().startswith(("rtsp://", "http://", "https://")):
-        print(f"[camera] Opening network source: {source}")
-        return cv2.VideoCapture(source)
-    else:
-        print(f"[camera] Opening local camera index: {source}")
-        return cv2.VideoCapture(int(source), cv2.CAP_DSHOW)
+    """RTSP-only. cv2.VideoCapture handles the RTSP URL directly (via
+    its FFmpeg backend); no local webcam index path anymore."""
+    print(f"[camera] Opening RTSP source: {source}")
+    return cv2.VideoCapture(source)
 
 
 def camera_reader_loop():
     cap = open_capture(CAMERA_STATE["source"])
     if not cap.isOpened():
         CAMERA_STATE["last_error"] = f"Could not open source: {CAMERA_STATE['source']}"
+        CAMERA_STATE["connecting"] = False
         print(f"[camera] ERROR: {CAMERA_STATE['last_error']}")
+        socketio.emit("camera_status", camera_status_payload())
         return
     CAMERA_STATE["cap"] = cap
     CAMERA_STATE["running"] = True
+    CAMERA_STATE["connecting"] = False
     print("[camera] Reader thread started")
+    socketio.emit("camera_status", camera_status_payload())
     while CAMERA_STATE["running"]:
         ok, frame = cap.read()
         if ok:
@@ -563,51 +579,104 @@ def camera_reader_loop():
     print("[camera] Reader thread stopped")
 
 
+def stop_camera_thread():
+    """Stops the currently-running reader thread (if any) and waits for
+    it to actually release its VideoCapture before returning, so a
+    subsequent set_camera_source() never has two threads touching the
+    stream at once."""
+    CAMERA_STATE["running"] = False
+    t = CAMERA_STATE.get("thread")
+    if t is not None and t.is_alive():
+        t.join(timeout=3.0)
+    CAMERA_STATE["thread"] = None
+    with CAMERA_STATE["lock"]:
+        CAMERA_STATE["latest_frame"] = None
+
+
+def set_camera_source(new_source):
+    """Switch (or set for the first time) the RTSP source, live, from
+    the UI. Stops any existing reader thread first, then starts a
+    fresh one against the new URL. Safe to call at startup too."""
+    new_source = (new_source or "").strip()
+    if not new_source:
+        return
+    stop_camera_thread()
+    CAMERA_STATE["source"] = new_source
+    CAMERA_STATE["last_error"] = None
+    CAMERA_STATE["connecting"] = True
+    socketio.emit("camera_status", camera_status_payload())
+    t = threading.Thread(target=camera_reader_loop, daemon=True)
+    CAMERA_STATE["thread"] = t
+    t.start()
+
+
+def camera_status_payload():
+    return {
+        "source": CAMERA_STATE["source"],
+        "running": CAMERA_STATE["running"],
+        "connecting": CAMERA_STATE["connecting"],
+        "last_error": CAMERA_STATE["last_error"],
+    }
+
+
 def get_latest_frame():
     with CAMERA_STATE["lock"]:
         return None if CAMERA_STATE["latest_frame"] is None else CAMERA_STATE["latest_frame"].copy()
 
 
 # ---------------------------------------------------------------------
-# Enrollment state: multi-view (front/left/right/top) capture flow for
-# the CURRENT person+depth, same UX as enroll_capture.py.
+# Enrollment state: two-phase flow, same idea as enroll_capture.py.
+#
+# Phase "setup" collects the person's name and every distance up front,
+# entirely from text fields -- no camera involved, so nothing can race
+# with typing. Phase "capture" (entered only once setup is submitted)
+# walks through those distances in order, four manual-capture views
+# each. The underlying RTSP reader thread never stops (live inference
+# shares it), but the enrollment UI simply doesn't request/display the
+# preview until Phase 2 starts.
 # ---------------------------------------------------------------------
 
 ENROLL_STATE = {
-    "person": "person_01",
-    "depth": 1.0,
+    "phase": "setup",       # "setup" | "capture" | "done"
+    "person": None,
+    "distances": [],        # sorted list of floats, set once at "Start capture"
+    "dist_index": 0,
     "view_index": 0,
-    "done": False,
+    "last_saved": None,
     "lock": threading.Lock(),
 }
 
 
-def _enroll_refresh():
-    ENROLL_STATE["view_index"] = 0
-    ENROLL_STATE["done"] = False
-
-
-def enroll_set_person(new_person):
+def enroll_start_capture(person, distances):
     with ENROLL_STATE["lock"]:
-        ENROLL_STATE["person"] = new_person
-        _enroll_refresh()
+        ENROLL_STATE["phase"] = "capture"
+        ENROLL_STATE["person"] = person
+        ENROLL_STATE["distances"] = distances
+        ENROLL_STATE["dist_index"] = 0
+        ENROLL_STATE["view_index"] = 0
+        ENROLL_STATE["last_saved"] = None
 
 
-def enroll_set_depth(new_depth):
+def enroll_reset():
     with ENROLL_STATE["lock"]:
-        ENROLL_STATE["depth"] = new_depth
-        _enroll_refresh()
+        ENROLL_STATE["phase"] = "setup"
+        ENROLL_STATE["person"] = None
+        ENROLL_STATE["distances"] = []
+        ENROLL_STATE["dist_index"] = 0
+        ENROLL_STATE["view_index"] = 0
+        ENROLL_STATE["last_saved"] = None
 
 
 def enroll_capture_view():
-    """Captures the CURRENT view for the CURRENT person+depth from the
-    live camera frame, extracts embedding+width, stores it, and
-    advances to the next view. Returns a result dict."""
+    """Captures the CURRENT view for the CURRENT person+distance from
+    the live camera frame, extracts embedding+width, stores it, and
+    advances to the next view (then the next distance, then "done").
+    Returns a result dict."""
     with ENROLL_STATE["lock"]:
-        if ENROLL_STATE["done"]:
-            return {"success": False, "error": "All 4 views already captured for this person/distance. Change distance or person to continue."}
+        if ENROLL_STATE["phase"] != "capture":
+            return {"success": False, "error": "Not currently in a capture session. Finish setup first."}
         person = ENROLL_STATE["person"]
-        depth = ENROLL_STATE["depth"]
+        depth = ENROLL_STATE["distances"][ENROLL_STATE["dist_index"]]
         view = VIEWS[ENROLL_STATE["view_index"]]
 
     frame = get_latest_frame()
@@ -633,23 +702,35 @@ def enroll_capture_view():
     save_gallery()
 
     with ENROLL_STATE["lock"]:
+        ENROLL_STATE["last_saved"] = f"{person} / {depth}m / {view}"
         ENROLL_STATE["view_index"] += 1
-        done = ENROLL_STATE["view_index"] >= len(VIEWS)
-        ENROLL_STATE["done"] = done
+        if ENROLL_STATE["view_index"] >= len(VIEWS):
+            ENROLL_STATE["view_index"] = 0
+            ENROLL_STATE["dist_index"] += 1
+            if ENROLL_STATE["dist_index"] >= len(ENROLL_STATE["distances"]):
+                ENROLL_STATE["phase"] = "done"
+        done = ENROLL_STATE["phase"] == "done"
 
     return {"success": True, "person": person, "depth": depth, "view_saved": view, "done": done}
 
 
 def enroll_status():
     with ENROLL_STATE["lock"]:
-        idx = ENROLL_STATE["view_index"]
-        return {
+        payload = {
+            "phase": ENROLL_STATE["phase"],
             "person": ENROLL_STATE["person"],
-            "depth": ENROLL_STATE["depth"],
-            "view_index": idx,
-            "prompt": VIEW_PROMPTS[VIEWS[idx]] if idx < len(VIEWS) else "",
-            "done": ENROLL_STATE["done"],
+            "distances": ENROLL_STATE["distances"],
+            "dist_index": ENROLL_STATE["dist_index"],
+            "view_index": ENROLL_STATE["view_index"],
+            "last_saved": ENROLL_STATE["last_saved"],
         }
+    if payload["phase"] == "capture" and payload["dist_index"] < len(payload["distances"]):
+        payload["current_distance"] = payload["distances"][payload["dist_index"]]
+        payload["prompt"] = VIEW_PROMPTS[VIEWS[payload["view_index"]]]
+    else:
+        payload["current_distance"] = None
+        payload["prompt"] = ""
+    return payload
 
 
 def people_payload():
@@ -677,13 +758,15 @@ def _push_people():
 # ---------------------------------------------------------------------
 
 def mjpeg_generator_raw():
-    """Plain preview (used during enrollment), with the current view
-    prompt overlaid -- same as enroll_capture.py's preview."""
+    """Plain preview (used during Phase 2 of enrollment), with the
+    current view prompt overlaid -- same as enroll_capture.py's
+    preview. The frontend only requests this feed once Phase 2 starts,
+    so nothing streams here during the text-entry phase."""
     while True:
         frame = get_latest_frame()
         if frame is not None:
             status = enroll_status()
-            if not status["done"] and status["prompt"]:
+            if status["phase"] == "capture" and status["prompt"]:
                 cv2.putText(frame, status["prompt"], (20, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             ok, buf = cv2.imencode(".jpg", frame)
@@ -786,7 +869,13 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
 <div id="connIndicator">Connecting...</div>
 <div class="nav"><a href="/report">Detection report</a></div>
 <h1 style="font-size:20px;">ADAR Admin -- Full Pipeline</h1>
-<div id="sourceInfo" class="status-line"></div>
+
+<div class="card">
+  <label style="font-size:12px;color:#999;display:block;margin-bottom:4px;">Camera source (RTSP)</label>
+  <input type="text" id="rtspInput" placeholder="rtsp://user:pass@192.168.1.50:554/stream1">
+  <button class="btn-secondary" onclick="connectCamera()">Connect</button>
+  <div id="cameraStatus" class="status-line"></div>
+</div>
 
 <div id="landingView">
   <div class="landing-card">
@@ -800,18 +889,42 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
   <span class="back-link" onclick="showLanding()">&larr; Back</span>
 
   <h2>1. Enroll a person</h2>
-  <div class="card">
+
+  <!-- Phase 1: setup -- text only, no camera -->
+  <div id="enrollSetup" class="card">
+    <p style="font-size:12px;color:#888;margin-top:0;">Camera stays off until this is submitted.</p>
     <input type="text" id="personInput" placeholder="Person name (e.g. Abhishek)">
-    <input type="number" step="0.1" min="0" id="distanceInput" placeholder="Distance from camera in meters (e.g. 0.5)">
-    <div>
-      <button class="btn-secondary" onclick="applyPerson()">Set person</button>
-      <button class="btn-secondary" onclick="applyDepth()">Set distance</button>
+    <label style="font-size:12px;color:#999;display:block;margin:10px 0 4px;">Number of distances to capture</label>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <button class="btn-secondary" type="button" onclick="changeDistCount(-1)">-</button>
+      <span id="distCountDisplay" style="font-family:monospace;font-size:18px;font-weight:700;">3</span>
+      <button class="btn-secondary" type="button" onclick="changeDistCount(1)">+</button>
     </div>
-    <img id="enrollPreview" src="/video_feed">
+    <div id="distanceGrid" style="margin-top:10px;"></div>
+    <button class="btn-primary" id="startCapBtn" onclick="startCapture()">Start capture &rarr;</button>
+    <div id="setupError" class="status-line" style="color:#ff8a6b;"></div>
+  </div>
+
+  <!-- Phase 2: guided capture -- camera preview appears here -->
+  <div id="enrollCapture" class="card" style="display:none;">
+    <div id="distProgress" style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;"></div>
+    <img id="enrollPreview" src="">
+    <div id="viewsRow" style="display:flex;gap:6px;margin:10px 0;">
+      <div class="view-chip" data-view="front" style="flex:1;text-align:center;padding:8px 4px;border-radius:6px;background:#111;border:1px solid #444;font-size:11px;color:#999;">FRONT</div>
+      <div class="view-chip" data-view="left" style="flex:1;text-align:center;padding:8px 4px;border-radius:6px;background:#111;border:1px solid #444;font-size:11px;color:#999;">LEFT</div>
+      <div class="view-chip" data-view="right" style="flex:1;text-align:center;padding:8px 4px;border-radius:6px;background:#111;border:1px solid #444;font-size:11px;color:#999;">RIGHT</div>
+      <div class="view-chip" data-view="top" style="flex:1;text-align:center;padding:8px 4px;border-radius:6px;background:#111;border:1px solid #444;font-size:11px;color:#999;">TOP</div>
+    </div>
     <div id="enrollStatus" class="status-line">Loading...</div>
     <button class="btn-primary" id="capBtn" onclick="doCapture()">CAPTURE</button>
     <div id="confirm" class="status-line"></div>
-    <p style="font-size:12px;color:#888;">All 4 views (front, left, right, top) are required at every distance before that person-distance pair counts as done. Capture at more than one real distance per person if you can (e.g. 0.5m, then walk back and capture again at 1.5m or 3m) -- one distance alone can't fit a meaningful decay curve.</p>
+  </div>
+
+  <!-- Phase done -->
+  <div id="enrollDone" class="card" style="display:none;text-align:center;">
+    <p class="ok" style="font-size:16px;">All distances captured.</p>
+    <p id="doneSummary" class="status-line"></p>
+    <button class="btn-secondary" onclick="socket.emit('enroll_reset')">Enroll another person</button>
   </div>
 
   <h2>Enrolled people</h2>
@@ -867,8 +980,6 @@ function showInferMode() {
 }
 
 const socket = io();
-const personEl = document.getElementById('personInput');
-const depthEl = document.getElementById('distanceInput');
 const connIndicator = document.getElementById('connIndicator');
 
 socket.on('connect', () => {
@@ -881,46 +992,132 @@ socket.on('disconnect', () => {
   connIndicator.className = 'disconnected';
 });
 
+// --- Phase 1 (setup) helpers: dynamic distance boxes, no camera ---
+let distCount = 3;
+function renderDistanceGrid() {
+  const grid = document.getElementById('distanceGrid');
+  grid.innerHTML = '';
+  for (let i = 0; i < distCount; i++) {
+    const wrap = document.createElement('div');
+    wrap.style.marginBottom = '6px';
+    wrap.innerHTML = `<label style="font-size:11px;color:#888;">Distance ${i + 1} (m)</label>
+      <input type="number" step="0.1" min="0" class="distInput">`;
+    grid.appendChild(wrap);
+  }
+}
+function changeDistCount(delta) {
+  distCount = Math.max(1, Math.min(8, distCount + delta));
+  document.getElementById('distCountDisplay').innerText = distCount;
+  renderDistanceGrid();
+}
+renderDistanceGrid();
+
+function startCapture() {
+  const errEl = document.getElementById('setupError');
+  const name = document.getElementById('personInput').value.trim();
+  const vals = Array.from(document.querySelectorAll('.distInput')).map(i => parseFloat(i.value));
+  errEl.innerText = '';
+  if (!name) { errEl.innerText = 'Enter a person name.'; return; }
+  if (vals.some(v => isNaN(v) || v < 0)) { errEl.innerText = 'Fill in every distance box with a valid number.'; return; }
+  document.getElementById('startCapBtn').disabled = true;
+  socket.emit('enroll_start_capture', {person: name, distances: vals}, (res) => {
+    document.getElementById('startCapBtn').disabled = false;
+    if (!res.success) errEl.innerText = res.error;
+  });
+}
+
 // This is the ONLY place enrollment status updates the UI from --
-// pushed by the server right after a real change (capture /
-// enroll_set_person / enroll_set_depth), never on a timer. That's what
-// stops it from clobbering the Person/Distance boxes while you're
-// typing: there is nothing to race against, unlike the old 2s poll.
+// pushed by the server right after a real change (start_capture /
+// capture / reset), never on a timer. Since the Person/Distance boxes
+// only exist in Phase 1, and no status push happens until you submit
+// Phase 1, there's nothing that can ever race with your typing.
 socket.on('enroll_status', (j) => {
-  // Still guard against overwriting a field you're actively typing in,
-  // in case an update arrives from elsewhere (e.g. a second device).
-  if (document.activeElement !== personEl) personEl.value = j.person;
-  if (document.activeElement !== depthEl) depthEl.value = j.depth;
-  const statusEl = document.getElementById('enrollStatus');
-  if (j.done) {
-    statusEl.innerText = `All 4 views captured for ${j.person} at ${j.depth}m. Change person and/or distance to keep going.`;
-    document.getElementById('capBtn').disabled = true;
-  } else {
-    statusEl.innerText = `${j.person} @ ${j.depth}m -- View ${j.view_index + 1} of 4: ${j.prompt}`;
+  const setupDiv = document.getElementById('enrollSetup');
+  const captureDiv = document.getElementById('enrollCapture');
+  const doneDiv = document.getElementById('enrollDone');
+
+  if (j.phase === 'setup') {
+    setupDiv.style.display = 'block';
+    captureDiv.style.display = 'none';
+    doneDiv.style.display = 'none';
+    document.getElementById('enrollPreview').src = '';  // camera off
+    return;
+  }
+
+  if (j.phase === 'capture') {
+    setupDiv.style.display = 'none';
+    captureDiv.style.display = 'block';
+    doneDiv.style.display = 'none';
+
+    const preview = document.getElementById('enrollPreview');
+    if (!preview.src) preview.src = '/video_feed';  // open the feed once, on entering Phase 2
+
+    const row = document.getElementById('distProgress');
+    row.innerHTML = j.distances.map((d, i) => {
+      const cls = i === j.dist_index ? 'ok' : (i < j.dist_index ? '' : '');
+      const style = i === j.dist_index
+        ? 'background:#1e5c33;color:#6fe38f;border-color:#2ecc71;'
+        : (i < j.dist_index ? 'color:#666;text-decoration:line-through;' : 'color:#999;');
+      return `<div style="flex:1;min-width:46px;text-align:center;font-family:monospace;font-size:11px;padding:6px 2px;border-radius:6px;background:#111;border:1px solid #444;${style}">${d}m</div>`;
+    }).join('');
+
+    document.querySelectorAll('.view-chip').forEach((chip, i) => {
+      if (i === j.view_index) { chip.style.borderColor = '#2ecc71'; chip.style.color = '#6fe38f'; }
+      else if (i < j.view_index) { chip.style.background = '#1e5c33'; chip.style.color = '#6fe38f'; chip.style.borderColor = '#444'; }
+      else { chip.style.background = '#111'; chip.style.color = '#999'; chip.style.borderColor = '#444'; }
+    });
+
+    document.getElementById('enrollStatus').innerText =
+      `${j.person} @ ${j.current_distance}m -- View ${j.view_index + 1} of 4: ${j.prompt}`;
     document.getElementById('capBtn').disabled = false;
+
+    if (j.last_saved) document.getElementById('confirm').innerText = 'Saved: ' + j.last_saved;
+    return;
+  }
+
+  if (j.phase === 'done') {
+    setupDiv.style.display = 'none';
+    captureDiv.style.display = 'none';
+    doneDiv.style.display = 'block';
+    document.getElementById('enrollPreview').src = '';  // camera preview closed again
+    document.getElementById('doneSummary').innerText =
+      `Captured 4 views at each of ${j.distances.length} distances (${j.distances.join('m, ')}m) for ${j.person}.`;
   }
 });
 
 socket.on('people_update', (j) => renderPeople(j.people));
 
-async function loadMeta() {
-  const r = await fetch('/api/source');
-  const j = await r.json();
-  document.getElementById('sourceInfo').innerText =
-    `Source: ${j.source} | Provider: ${j.active_provider} | GPU: ${j.gpu_used}` +
-    (j.camera_error ? ` | CAMERA ERROR: ${j.camera_error}` : '');
-}
+// Dirty flag so an incoming camera_status push (e.g. a connection
+// error arriving from a previous attempt) never overwrites the URL
+// you're currently typing -- same pattern used for the enrollment
+// fields elsewhere in this app.
+const rtspEl = document.getElementById('rtspInput');
+let rtspDirty = false;
+rtspEl.addEventListener('input', () => { rtspDirty = true; });
 
-function applyPerson() {
-  const name = personEl.value.trim();
-  if (!name) return;
-  socket.emit('enroll_set_person', {person: name});
-}
+socket.on('camera_status', (j) => {
+  if (!rtspDirty && j.source) rtspEl.value = j.source;
+  const el = document.getElementById('cameraStatus');
+  if (j.connecting) {
+    el.innerHTML = '<span class="warn">Connecting...</span>';
+  } else if (j.running) {
+    el.innerHTML = `<span class="ok">Connected</span> to ${j.source}`;
+  } else if (j.last_error) {
+    el.innerHTML = `<span class="warn">${j.last_error}</span>`;
+  } else {
+    el.innerText = 'No camera source set yet.';
+  }
+});
 
-function applyDepth() {
-  const depth = parseFloat(depthEl.value);
-  if (isNaN(depth)) return;
-  socket.emit('enroll_set_depth', {depth});
+function connectCamera() {
+  const url = rtspEl.value.trim();
+  const el = document.getElementById('cameraStatus');
+  if (!url) { el.innerHTML = '<span class="warn">Enter an RTSP URL first.</span>'; return; }
+  rtspDirty = false;  // committing -- safe to accept status syncs again
+  el.innerText = 'Connecting...';
+  socket.emit('set_camera_source', {source: url}, (res) => {
+    if (!res.success) el.innerHTML = '<span class="warn">' + res.error + '</span>';
+  });
 }
 
 function doCapture() {
@@ -988,7 +1185,6 @@ async function detectOnce() {
   document.getElementById('detectResult').innerText = JSON.stringify(j, null, 2);
 }
 
-loadMeta();
 showLanding();
 </script>
 </body>
@@ -1049,30 +1245,49 @@ def api_delete_person(name):
 
 @socketio.on("connect")
 def on_connect():
-    """Push current enrollment status + people list immediately to a
-    newly-connected/reconnected client, so the page is never stuck on
-    'Loading...'."""
+    """Push current enrollment status + people list + camera status
+    immediately to a newly-connected/reconnected client, so the page
+    is never stuck on 'Loading...'."""
     socketio.emit("enroll_status", enroll_status(), to=request.sid)
     socketio.emit("people_update", people_payload(), to=request.sid)
+    socketio.emit("camera_status", camera_status_payload(), to=request.sid)
 
 
-@socketio.on("enroll_set_person")
-def on_enroll_set_person(payload):
-    name = str((payload or {}).get("person", "")).strip()
-    if not name:
-        return {"success": False, "error": "Empty name."}
-    enroll_set_person(name)
+@socketio.on("set_camera_source")
+def on_set_camera_source(payload):
+    """Lets the RTSP URL be entered/changed from the UI instead of only
+    at server startup via --source. Tears down any existing reader
+    thread and opens a fresh one against the new URL."""
+    url = str((payload or {}).get("source", "")).strip()
+    if not url:
+        return {"success": False, "error": "Enter an RTSP URL first."}
+    if not url.lower().startswith("rtsp://"):
+        return {"success": False, "error": "This must be an rtsp:// URL."}
+    set_camera_source(url)
+    return {"success": True}
+
+
+@socketio.on("enroll_start_capture")
+def on_enroll_start_capture(payload):
+    payload = payload or {}
+    person = str(payload.get("person", "")).strip()
+    raw_distances = payload.get("distances", [])
+    try:
+        distances = sorted(float(d) for d in raw_distances)
+    except (TypeError, ValueError):
+        return {"success": False, "error": "Invalid distance value."}
+
+    if not person or not distances:
+        return {"success": False, "error": "Person name and at least one distance are required."}
+
+    enroll_start_capture(person, distances)
     _push_enroll_status()
     return {"success": True}
 
 
-@socketio.on("enroll_set_depth")
-def on_enroll_set_depth(payload):
-    try:
-        depth = float((payload or {}).get("depth"))
-    except (TypeError, ValueError):
-        return {"success": False, "error": "Invalid distance."}
-    enroll_set_depth(depth)
+@socketio.on("enroll_reset")
+def on_enroll_reset():
+    enroll_reset()
     _push_enroll_status()
     return {"success": True}
 
@@ -1206,30 +1421,16 @@ def health():
 # Startup
 # ---------------------------------------------------------------------
 
-def prompt_for_source():
-    print("\nWhich camera source do you want to use?")
-    print("  1) Local webcam")
-    print("  2) RTSP URL (real CCTV / IP camera)")
-    choice = input("Enter 1 or 2: ").strip()
-    if choice == "2":
-        url = input("Paste the full RTSP URL (e.g. rtsp://user:pass@192.168.1.50:554/stream1): ").strip()
-        return url
-    else:
-        idx = input("Webcam index (press Enter for default 0): ").strip()
-        return idx if idx else "0"
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default=None,
-                         help="Camera index (e.g. 0) or RTSP/HTTP URL. If omitted, you'll be asked at startup.")
+                         help="Optional RTSP URL to connect at startup, e.g. "
+                              "rtsp://user:pass@192.168.1.50:554/stream1. If omitted, "
+                              "enter it from the admin panel's Camera source box instead.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--no_warmup", action="store_true", help="Skip startup warm-up (not recommended on GPU)")
     args = parser.parse_args()
-
-    source = args.source if args.source is not None else prompt_for_source()
-    CAMERA_STATE["source"] = source
 
     ensure_log_file()
     load_gallery()
@@ -1243,12 +1444,15 @@ def main():
     if not args.no_warmup:
         warm_up()
 
-    t = threading.Thread(target=camera_reader_loop, daemon=True)
-    t.start()
-    time.sleep(1.0)
-    if CAMERA_STATE["last_error"]:
-        print(f"\n[WARNING] {CAMERA_STATE['last_error']}")
-        print("The admin panel will still start, but the camera feed won't work until this is fixed.\n")
+    if args.source:
+        set_camera_source(args.source)
+        time.sleep(1.0)
+        if CAMERA_STATE["last_error"]:
+            print(f"\n[WARNING] {CAMERA_STATE['last_error']}")
+            print("The admin panel will still start -- fix the URL from the Camera source box on the page.\n")
+    else:
+        print("\n[startup] No RTSP URL given via --source -- enter one in the admin panel's")
+        print("          'Camera source' box once it's open. Nothing here blocks on that.\n")
 
     print(f"\nAdmin panel ready. Open this in a browser:")
     print(f"   http://<this-machine-ip>:{args.port}")
