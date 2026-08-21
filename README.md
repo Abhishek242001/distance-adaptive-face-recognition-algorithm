@@ -83,6 +83,9 @@ Then open `http://<your-laptop-ip>:8000/test` on your phone (same WiFi)
 to try a live detection, or `/stream_page` to view the laptop's webcam
 with live detection boxes.
 
+Want to sanity-check the camera/model pipeline without the browser or
+phone at all? See **Terminal test mode** below.
+
 **Option B — single-file admin panel:**
 
 ```bash
@@ -97,6 +100,33 @@ calibrate, live view, report) happens from that one page.
 `requirements.txt` includes `flask-socketio`, needed by both
 `enroll_capture.py` and `adar_admin.py` for their WebSocket-based
 status updates.
+
+## Terminal test mode (no browser, no server)
+
+`api_server.py` also has a standalone `--test` mode for quickly
+checking a local webcam or an RTSP/HTTP camera straight from the
+terminal — no Flask server, no phone, no browser required. It runs
+the exact same detection pipeline as `/detect` and `/stream`, prints
+each detection to the terminal, and (unless `--no_display`) shows a
+live annotated window with green/red boxes.
+
+```bash
+# laptop webcam (index 0)
+python api_server.py --test --calibration_dir calibration_output
+
+# a specific webcam index
+python api_server.py --test --source 1 --calibration_dir calibration_output
+
+# an RTSP camera
+python api_server.py --test --source "rtsp://user:pass@192.168.1.50:554/stream1" --calibration_dir calibration_output
+
+# headless (SSH box / no display) -- terminal output only
+python api_server.py --test --source 0 --no_display --calibration_dir calibration_output
+```
+
+Press `q` in the video window (or Ctrl+C in the terminal) to stop.
+Detections are still logged to `logs/session_log.csv`, tagged with
+source `terminal_test`.
 
 ## GPU acceleration
 
