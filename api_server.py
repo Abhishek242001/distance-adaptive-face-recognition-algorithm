@@ -20,8 +20,26 @@ logged to logs/session_log.csv (created automatically) and kept in
 memory for the /report page, so you have a persistent record of who
 was seen, when, at what distance, and whether they were accepted.
 
-Run it:
+Run it (as an API server):
     python api_server.py --calibration_dir calibration_output --port 8000
+
+Or quickly test the camera/model pipeline straight from the terminal,
+with no Flask server involved -- opens a local webcam or an RTSP/HTTP
+URL, runs live detection, prints results to the terminal, and (unless
+--no_display) shows an annotated OpenCV window. Press 'q' in the window
+(or Ctrl+C in the terminal) to stop.
+
+    # Laptop webcam (index 0)
+    python api_server.py --test --calibration_dir calibration_output
+
+    # A specific webcam index
+    python api_server.py --test --source 1 --calibration_dir calibration_output
+
+    # An RTSP/HTTP camera
+    python api_server.py --test --source "rtsp://user:pass@192.168.1.50:554/stream1" --calibration_dir calibration_output
+
+    # Same, but headless (no GUI window -- just terminal output)
+    python api_server.py --test --source 0 --no_display --calibration_dir calibration_output
 """
 
 import argparse
@@ -460,18 +478,10 @@ def error_response(message: str, status_code: int = 400):
 # ---------------------------------------------------------------------
 
 def camera_worker():
-    source = STREAM_STATE.get("source") or STREAM_STATE["camera_index"]
-    # RTSP/HTTP URLs must NOT use CAP_DSHOW -- that backend is Windows
-    # local-webcam-only and will fail to open a network stream. Only pass
-    # CAP_DSHOW when the source is a local integer camera index.
-    if isinstance(source, str) and source.strip().lower().startswith(("rtsp://", "http://", "https://")):
-        cap = cv2.VideoCapture(source)
-        print(f"[stream] Opening network source: {source}")
-    else:
-        cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
-        print(f"[stream] Opening local camera index: {source}")
+    source = resolve_capture_source(STREAM_STATE.get("source"), STREAM_STATE["camera_index"])
+    cap = open_capture(source)
     if not cap.isOpened():
-        STREAM_STATE["last_error"] = f"Could not open camera index {STREAM_STATE['camera_index']}"
+        STREAM_STATE["last_error"] = f"Could not open source {source!r}"
         STREAM_STATE["running"] = False
         print(f"[stream] ERROR: {STREAM_STATE['last_error']}")
         return
@@ -717,6 +727,113 @@ def health():
     }), 200
 
 
+def resolve_capture_source(source_arg, camera_index):
+    """Turn a --source CLI value into something cv2.VideoCapture understands:
+    None/blank -> fall back to --camera_index (int); a bare digit string ->
+    int camera index; anything else (rtsp://, http://, https://, ...) -> the
+    URL string as-is."""
+    if source_arg is None or str(source_arg).strip() == "":
+        return camera_index
+    source_arg = str(source_arg).strip()
+    if source_arg.isdigit():
+        return int(source_arg)
+    return source_arg
+
+
+def open_capture(source):
+    """Open a cv2.VideoCapture the same way for both the /stream API and the
+    terminal test mode. RTSP/HTTP URLs must NOT use CAP_DSHOW -- that backend
+    is Windows local-webcam-only and will fail to open a network stream."""
+    if isinstance(source, str) and source.lower().startswith(("rtsp://", "http://", "https://")):
+        print(f"[capture] Opening network source: {source}")
+        return cv2.VideoCapture(source)
+    print(f"[capture] Opening local camera index: {source}")
+    return cv2.VideoCapture(source, cv2.CAP_DSHOW)
+
+
+def run_terminal_test(source_arg, camera_index, detect_every_n=5, show_window=True):
+    """Standalone terminal test: open a local webcam or an RTSP/HTTP URL and
+    run the live detection loop without starting the Flask API. Useful for a
+    quick sanity check of the camera/model pipeline straight from the
+    terminal. Prints every detection and, unless show_window is False, shows
+    a live annotated window (green box = ACCEPT, red = REJECT). Press 'q' in
+    the window, or Ctrl+C in the terminal, to stop.
+    """
+    ensure_log_file()
+    source = resolve_capture_source(source_arg, camera_index)
+    cap = open_capture(source)
+
+    if not cap.isOpened():
+        print(f"[test] ERROR: could not open source {source!r}. "
+              f"Check the camera index / RTSP URL, and that no other app is using the camera.")
+        return
+
+    window_name = "ADAR v3 - Terminal Test (press q to quit)"
+    display_enabled = show_window
+    if display_enabled:
+        try:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        except cv2.error:
+            print("[test] No display available -- falling back to terminal-only output.")
+            display_enabled = False
+
+    frame_count = 0
+    last_result = None
+    print("[test] Running. Press 'q' in the video window (or Ctrl+C here) to stop.\n")
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("[test] Warning: failed to read frame, retrying...")
+                time.sleep(0.05)
+                continue
+
+            frame_count += 1
+            if frame_count % max(detect_every_n, 1) == 0 or last_result is None:
+                try:
+                    last_result = run_detection(frame)
+                    for i in range(last_result["num_faces_detected"]):
+                        name = last_result["employee_detected"][i]
+                        decision = last_result["decision"][i]
+                        dist = last_result["distance_m"][i]
+                        sim = last_result["similarity"][i]
+                        snr_val = last_result["snr"][i]
+                        log_event("terminal_test", name, decision, dist, sim, snr_val,
+                                  last_result["view_matched"][i])
+                        print(f"[detect] {name:<15} {decision:<8} "
+                              f"dist={dist if dist is not None else 'N/A'}m  "
+                              f"sim={sim if sim is not None else 'N/A'}  "
+                              f"snr={snr_val if snr_val is not None else 'N/A'}")
+                    if last_result["num_faces_detected"] == 0:
+                        print("[detect] no face in frame")
+                except Exception:
+                    print(f"[test] Detection error:\n{traceback.format_exc(limit=1)}")
+
+            if display_enabled:
+                annotated = frame.copy()
+                if last_result:
+                    for i in range(last_result["num_faces_detected"]):
+                        x1, y1, x2, y2 = last_result["bounding_boxes"][i]
+                        accepted = last_result["decision"][i] == "ACCEPT"
+                        color = (0, 200, 0) if accepted else (0, 0, 220)
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                        dist_txt = f'{last_result["distance_m"][i]}m' if last_result["distance_m"][i] is not None else ''
+                        label = f'{last_result["employee_detected"][i]} {dist_txt}'
+                        cv2.putText(annotated, label, (x1, max(y1 - 8, 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.imshow(window_name, annotated)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+    except KeyboardInterrupt:
+        print("\n[test] Stopped (Ctrl+C).")
+    finally:
+        cap.release()
+        if display_enabled:
+            cv2.destroyAllWindows()
+        print(f"[test] Done. {frame_count} frames read this session. Log saved to {LOG_CSV_PATH}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--calibration_dir", default="calibration_output")
@@ -725,7 +842,29 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--camera_index", type=int, default=0, help="Webcam index for /stream (default 0)")
     parser.add_argument("--no_warmup", action="store_true", help="Skip startup warm-up (not recommended on GPU)")
+    parser.add_argument("--test", action="store_true",
+                         help="Run a standalone terminal test instead of starting the Flask server: "
+                              "opens the local webcam or an RTSP/HTTP url, runs live detection, and "
+                              "(unless --no_display) shows an OpenCV window. Press 'q' to quit.")
+    parser.add_argument("--source", default=None,
+                         help="Camera source for --test mode: a local camera index (e.g. 0) or an "
+                              "RTSP/HTTP URL (e.g. rtsp://user:pass@192.168.1.50:554/stream1). "
+                              "If omitted, falls back to --camera_index.")
+    parser.add_argument("--no_display", action="store_true",
+                         help="With --test: don't open a video window, just print detections to the "
+                              "terminal (useful over SSH / on a headless machine).")
+    parser.add_argument("--detect_every_n", type=int, default=5,
+                         help="With --test: run full detection every N frames (default 5). "
+                              "Higher = faster/lighter, lower = more frequent updates.")
     args = parser.parse_args()
+
+    if args.test:
+        load_state(Path(args.calibration_dir))
+        if not args.no_warmup:
+            warm_up(STATE["face_app"], args.dataset_root)
+        run_terminal_test(args.source, args.camera_index, args.detect_every_n,
+                           show_window=not args.no_display)
+        return
 
     ensure_log_file()
     STREAM_STATE["camera_index"] = args.camera_index
